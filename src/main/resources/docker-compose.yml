@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: openrag-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=knowledge_base
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d knowledge_base"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: openrag-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  ollama-init:
+    image: curlimages/curl:latest
+    container_name: openrag-ollama-init
+    depends_on:
+      - ollama
+    command: >
+      sh -c "sleep 10 &&
+             curl -X POST http://ollama:11434/api/pull -d '{\"name\":\"nomic-embed-text\"}' &&
+             curl -X POST http://ollama:11434/api/pull -d '{\"name\":\"llama3.2:3b\"}'"
+
+volumes:
+  ollama_data:
