@@ -1,76 +1,40 @@
 package com.maheshz.openrag.engine.controller;
 
 import com.maheshz.openrag.engine.controller.dto.UploadResponse;
+import com.maheshz.openrag.engine.domain.KnowledgeDocument;
 import com.maheshz.openrag.engine.repository.DocumentRepository;
 import com.maheshz.openrag.engine.security.TenantContextHolder;
-import com.maheshz.openrag.engine.service.AsyncIngestionWorker;
-import com.maheshz.openrag.engine.service.IngestionService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.maheshz.openrag.engine.service.IngestionOrchestrator;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.UUID;
-
 @RestController
 @RequestMapping("/api/knowledge")
+@Tag(name = "1. Evidence Ingestion", description = "Endpoints for safely uploading and vectorizing raw forensic files.")
 public class IngestionController {
 
-    private static final Logger log = LoggerFactory.getLogger(IngestionController.class);
-
-    private final AsyncIngestionWorker asyncIngestionWorker;
+    private final IngestionOrchestrator ingestionOrchestrator;
     private final DocumentRepository documentRepository;
-    private final IngestionService ingestionService;
 
-    // Inject all required services and repositories here
-    public IngestionController(AsyncIngestionWorker asyncIngestionWorker,
-                               DocumentRepository documentRepository,
-                               IngestionService ingestionService) {
-        this.asyncIngestionWorker = asyncIngestionWorker;
+    public IngestionController(IngestionOrchestrator ingestionOrchestrator, DocumentRepository documentRepository) {
+        this.ingestionOrchestrator = ingestionOrchestrator;
         this.documentRepository = documentRepository;
-        this.ingestionService = ingestionService;
     }
 
-    @PostMapping("/text")
-    public ResponseEntity<String> ingestTextData(
-            @RequestParam String folderId,
-            @RequestBody String content) {
-
-        ingestionService.ingestText(content, folderId);
-        return ResponseEntity.ok("Data successfully vectorized and stored.");
-    }
-
-    @PostMapping("/upload")
+    @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @Operation(summary = "Upload Raw Evidence", description = "Accepts .txt, .pdf, or .docx files. Executes Tika extraction and Vector embedding asynchronously.")
     public ResponseEntity<UploadResponse> uploadDocument(
             @RequestParam("file") MultipartFile file,
             @RequestParam("folderId") String folderId) {
 
         String tenantId = TenantContextHolder.getTenantId();
-        String jobId = UUID.randomUUID().toString();
+        String jobId = ingestionOrchestrator.initiateFileUpload(file, tenantId, folderId);
 
-        try {
-            Path tempPath = Files.createTempFile("ingest-", "-" + file.getOriginalFilename());
-            Files.copy(file.getInputStream(), tempPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            File tempFile = tempPath.toFile();
-
-            log.info("Dispatched async ingestion job: {}", jobId);
-            asyncIngestionWorker.processFile(tempFile, tenantId, folderId, jobId);
-
-            return ResponseEntity.accepted().body(new UploadResponse(jobId));
-        } catch (Exception e) {
-            log.error("Failed to initiate upload for job {}", jobId, e);
-            return ResponseEntity.internalServerError().build();
-        }
+        return ResponseEntity.accepted().body(new UploadResponse(jobId));
     }
 
-    @GetMapping("/status/{jobId}")
-    public ResponseEntity<com.maheshz.openrag.engine.domain.KnowledgeDocument> checkUploadStatus(@PathVariable String jobId) {
-        return documentRepository.findByJobId(jobId)
-                .map(doc -> ResponseEntity.ok(doc))
-                .orElse(ResponseEntity.notFound().build());
-    }
 }

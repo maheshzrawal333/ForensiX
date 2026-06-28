@@ -5,7 +5,7 @@ services:
     image: ankane/pgvector:latest
     container_name: openrag-postgres
     ports:
-      - "5432:5432"
+      - "5434:5432"
     environment:
       - POSTGRES_DB=knowledge_base
       - POSTGRES_USER=postgres

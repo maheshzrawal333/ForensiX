@@ -5,6 +5,8 @@ import com.maheshz.openrag.engine.repository.TenantRepository;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
+
 @RestController
 @RequestMapping("/api/admin/tenants")
 public class TenantAdminController {
@@ -17,14 +19,18 @@ public class TenantAdminController {
 
     @PostMapping
     public ResponseEntity<Tenant> registerTenant(@RequestParam String id, @RequestParam String name) {
-        // This utilizes setId(), setName(), and setCreatedAt()
         Tenant newTenant = new Tenant(id, name);
         return ResponseEntity.ok(tenantRepository.save(newTenant));
     }
 
+    // --- NEW: Fetch all cases for the frontend dropdown ---
+    @GetMapping
+    public ResponseEntity<List<Tenant>> getAllTenants() {
+        return ResponseEntity.ok(tenantRepository.findAll());
+    }
+
     @GetMapping("/{id}")
     public ResponseEntity<Tenant> getTenant(@PathVariable String id) {
-        // This utilizes getId(), getName(), etc. for the JSON output
         return tenantRepository.findById(id)
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
