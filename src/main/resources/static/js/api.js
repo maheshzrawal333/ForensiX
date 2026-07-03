@@ -123,12 +123,14 @@ const ApiService = {
     // AI FORENSICS API
     // ==========================================
     askStructuredQuestion: async (question, folderIds, caseId, modelName) => {
-        // SENIOR FIX #9: LLM inference needs a longer timeout (120 seconds)
+        // SENIOR FIX: Increased timeout from 120,000ms to 300,000ms (5 minutes).
+        // Tabular data (CSVs) and dense RAG contexts require massive compute time
+        // for local LLMs to generate tokens. We must not sever the connection prematurely.
         return await ApiService._fetch('/api/forensics/analyze', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': caseId },
             body: JSON.stringify({ question, folderIds, model: modelName })
-        }, 120000);
+        }, 300000);
     },
 
     generateReport: async (validatedEvidenceList, caseId, modelName) => {
