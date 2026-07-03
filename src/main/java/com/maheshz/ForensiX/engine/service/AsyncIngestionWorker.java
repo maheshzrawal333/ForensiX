@@ -29,17 +29,32 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Enterprise Asynchronous Ingestion & Vectorization Engine.
+ * <p>
+ * This worker manages the high-latency, compute-intensive pipeline required to transform
+ * raw forensic binary files into high-dimensional vector embeddings for RAG (Retrieval-Augmented Generation).
+ * <p>
+ * ARCHITECTURAL DESIGN:
+ * To maintain high availability, this service runs entirely on a dedicated thread pool
+ * (`aiTaskExecutor`). It operates via a "Pull-and-Push" model: pulling streams from
+ * S3, parsing them, and pushing embeddings into `pgvector`.
+ */
 @Service
 public class AsyncIngestionWorker {
 
     private static final Logger log = LoggerFactory.getLogger(AsyncIngestionWorker.class);
 
+    /**
+     * Hyperparameter: Tuning the throughput of the vector database.
+     * Higher values increase ingestion speed but elevate the risk of hitting
+     * database transaction timeouts or token-limit exhaustion.
+     */
     private static final int EMBEDDING_BATCH_SIZE = 5;
 
     private final VectorStore vectorStore;
     private final DocumentRepository documentRepository;
     private final VectorCleanupRepository vectorCleanupRepository;
-
     private final StorageService storageService;
     private final StringRedisTemplate redisTemplate;
 
@@ -55,26 +70,37 @@ public class AsyncIngestionWorker {
         this.redisTemplate = redisTemplate;
     }
 
+    /**
+     * Executes the end-to-end ingestion pipeline for an uploaded artifact.
+     * <p>
+     * WORKFLOW:
+     * 1. Download: Stream binary from S3 directly to RAM.
+     * 2. Parse/Extract: Utilize Apache Tika for binaries or custom CSV parsers for tabular data.
+     * 3. Chunk: Tokenize text to fit within the LLM context window.
+     * 4. Embed: Generate high-dimensional vectors and push to pgvector.
+     * 5. Finalize: Update job state in relational DB.
+     *
+     * @param objectKey The S3 URI provided by the storage service.
+     * @param tracker The relational record tracking this job's lifecycle status.
+     */
     @Async("aiTaskExecutor")
     public void processFileAsync(String objectKey, KnowledgeDocument tracker) {
         String jobId = tracker.getJobId();
         String fileName = tracker.getFileName().toLowerCase();
         long processStartTime = System.currentTimeMillis();
 
-        // Use try-with-resources to guarantee the network stream is closed, preventing memory leaks
+        // -----------------------------------------------------------
+        // 1. STREAMING ACCESS: Essential for Memory Safety
+        // -----------------------------------------------------------
         try (InputStream cloudStream = storageService.downloadFile(objectKey)) {
             documentRepository.updateJobStatus(tracker.getId(), JobStatus.PROCESSING);
 
             // ==========================================
-            // BRANCH 1: CSV FILES (Self-Managing)
+            // BRANCH 1: TABULAR CSV (Semantic Extraction)
             // ==========================================
             if (fileName.endsWith(".csv")) {
                 broadcastProgress(jobId, "Tabular data detected. Executing memory-safe semantic CSV extraction...");
-
-                // FIX 1: Pass the tracker as the second argument
-                // FIX 2: We do NOT assign this to 'chunkedDocuments' because this method handles database inserts dynamically
                 extractCsvSemantically(cloudStream, tracker);
-
                 broadcastProgress(jobId, "Tabular processing and vector embedding complete.");
 
                 // ==========================================
@@ -93,7 +119,12 @@ public class AsyncIngestionWorker {
                 int totalChunks = chunkedDocuments.size();
                 broadcastProgress(jobId, "Target parsed successfully into " + totalChunks + " discrete chunks.");
 
-                // Inject Strict Metadata
+                // -----------------------------------------------------------
+                // 2. METADATA STAMPING: Enforcing Multi-Tenancy
+                // -----------------------------------------------------------
+                // We inject the Tenant and Folder ID into every metadata block.
+                // This is the "secret sauce" that allows our HybridSearchRepository
+                // to filter searches by case or folder instantly.
                 chunkedDocuments.forEach(doc -> {
                     doc.getMetadata().put(MetadataConstants.TENANT_ID, tracker.getTenantId());
                     doc.getMetadata().put(MetadataConstants.FOLDER_ID, tracker.getFolderId());
@@ -103,13 +134,16 @@ public class AsyncIngestionWorker {
 
                 log.info("Beginning vectorized partitioning for job {}. Total blocks: {}", jobId, totalChunks);
 
-                // Manual batch-embedding loop for unstructured files
+                // Manual batch-embedding loop for performance monitoring
                 for (int i = 0; i < totalChunks; i += EMBEDDING_BATCH_SIZE) {
                     int endOffset = Math.min(i + EMBEDDING_BATCH_SIZE, totalChunks);
                     List<Document> subBatch = chunkedDocuments.subList(i, endOffset);
 
                     vectorStore.add(subBatch);
 
+                    // -----------------------------------------------------------
+                    // 3. REAL-TIME PROGRESS TELEMETRY
+                    // -----------------------------------------------------------
                     int processedCount = endOffset;
                     int percentComplete = (int) (((double) processedCount / totalChunks) * 100);
                     long elapsedDurationMs = System.currentTimeMillis() - processStartTime;
@@ -129,23 +163,30 @@ public class AsyncIngestionWorker {
             documentRepository.updateJobStatus(tracker.getId(), JobStatus.COMPLETED);
             log.info("Job {} processing successfully finalized.", jobId);
 
+            // -----------------------------------------------------------
+            // 4. TRANSACTIONAL ROLLBACK: Ghost Vector Prevention
+            // -----------------------------------------------------------
         } catch (Exception e) {
             log.error("Fatal exception caught during execution workflow for job {}", jobId, e);
             documentRepository.updateJobStatus(tracker.getId(), JobStatus.FAILED);
+            // If the process fails halfway, wipe out the orphaned embeddings to keep the vector database clean
             vectorCleanupRepository.wipeVectorsByDocumentId(tracker.getId(), tracker.getTenantId());
             log.warn("Rolled back partial vectors for failed document: {}", tracker.getId());
             broadcastProgress(jobId, "Pipeline Failure: " + e.getMessage());
         } finally {
-            // SENIOR FIX: DO NOT DELETE THE FILE FROM S3!
-            // We need to retain the original physical file in the vault for forensic evidence retrieval.
+            // Signal termination to the SSE stream. Note: We retain the physical file in S3 for evidence retention.
             broadcastComplete(jobId);
         }
     }
 
-    // Batch-Flushing Memory Strategy
+    /**
+     * Parses CSV rows into semantic chunks using a "sliding window" approach.
+     * This method is specifically optimized for memory consumption by flushing
+     * results to the vector store every 100 records.
+     */
     private List<Document> extractCsvSemantically(InputStream inputStream, KnowledgeDocument tracker) {
         List<Document> memoryBuffer = new ArrayList<>();
-        int batchSize = 100; // Flush to vector store every 100 documents to save RAM
+        int batchSize = 100;
         int totalProcessed = 0;
 
         try (Reader reader = new InputStreamReader(inputStream, StandardCharsets.UTF_8);
@@ -164,11 +205,9 @@ public class AsyncIngestionWorker {
                 }
                 chunkBuilder.append(". \n");
 
-                // Every 10 rows, create a single Document chunk
+                // Batching rows to create a semantic block
                 if (rowIndex % 10 == 0) {
                     Document doc = new Document(chunkBuilder.toString());
-
-                    // Inject metadata immediately
                     doc.getMetadata().put(MetadataConstants.TENANT_ID, tracker.getTenantId());
                     doc.getMetadata().put(MetadataConstants.FOLDER_ID, tracker.getFolderId());
                     doc.getMetadata().put(MetadataConstants.DOCUMENT_ID, tracker.getId());
@@ -178,17 +217,17 @@ public class AsyncIngestionWorker {
                     chunkBuilder = new StringBuilder();
                 }
 
-                // SENIOR MEMORY FIX: Flush to DB and clear RAM every 100 documents
+                // Periodic flushing to memory/db management
                 if (memoryBuffer.size() >= batchSize) {
                     vectorStore.add(memoryBuffer);
                     totalProcessed += memoryBuffer.size();
-                    memoryBuffer.clear(); // Free up RAM for garbage collection
+                    memoryBuffer.clear();
                     broadcastProgress(tracker.getJobId(), "Streaming tabular data... embedded " + totalProcessed + " chunks.");
                 }
                 rowIndex++;
             }
 
-            // Flush remaining trailing data
+            // Flush remaining data
             if (!chunkBuilder.isEmpty()) {
                 Document doc = new Document(chunkBuilder.toString());
                 doc.getMetadata().put(MetadataConstants.TENANT_ID, tracker.getTenantId());
@@ -206,13 +245,8 @@ public class AsyncIngestionWorker {
             throw new RuntimeException("CSV Parsing Failed", e);
         }
 
-        // Return an empty list because we already handled the database inserts dynamically!
         return new ArrayList<>();
     }
-
-    // ==========================================
-    // PRIVATE REDIS TELEMETRY HELPERS
-    // ==========================================
 
     private void broadcastProgress(String jobId, String message) {
         String channel = RedisPubSubConfig.PROGRESS_TOPIC_PREFIX + jobId;
