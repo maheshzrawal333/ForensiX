@@ -4,10 +4,10 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-public class OpenRagEngineApplication {
+public class ForensiXEngineApplication {
 
 	public static void main(String[] args) {
-		SpringApplication.run(OpenRagEngineApplication.class, args);
+		SpringApplication.run(ForensiXEngineApplication.class, args);
 	}
 
 }
