@@ -1,0 +1,38 @@
+package com.maheshz.ForensiX.engine.controller;
+
+import com.maheshz.ForensiX.engine.domain.Tenant;
+import com.maheshz.ForensiX.engine.repository.TenantRepository;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/admin/tenants")
+public class TenantAdminController {
+
+    private final TenantRepository tenantRepository;
+
+    public TenantAdminController(TenantRepository tenantRepository) {
+        this.tenantRepository = tenantRepository;
+    }
+
+    @PostMapping
+    public ResponseEntity<Tenant> registerTenant(@RequestParam String id, @RequestParam String name) {
+        Tenant newTenant = new Tenant(id, name);
+        return ResponseEntity.ok(tenantRepository.save(newTenant));
+    }
+
+    // --- NEW: Fetch all cases for the frontend dropdown ---
+    @GetMapping
+    public ResponseEntity<List<Tenant>> getAllTenants() {
+        return ResponseEntity.ok(tenantRepository.findAll());
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Tenant> getTenant(@PathVariable String id) {
+        return tenantRepository.findById(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+}

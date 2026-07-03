@@ -1,0 +1,84 @@
+ Give me complete comments for my code documentation like a senior software engineer.
+
+# ForensiX:
+
+[![Java Support](https://img.shields.io/badge/Java-23-blue.svg)](https://www.oracle.com/java/)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.4.0-brightgreen.svg)](https://spring.io/projects/spring-boot)
+[![Spring AI](https://img.shields.io/badge/Spring%20AI-1.0.0--M4-green.svg)](https://spring.io/projects/spring-ai)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15.4-blue.svg)](https://www.postgresql.org/)
+[![Ollama](https://img.shields.io/badge/Ollama-Local%20LLMs-black.svg)](https://ollama.ai/)
+
+**ForensiX** is an enterprise-grade, human-in-the-loop Retrieval-Augmented Generation (RAG) platform designed for digital forensic analysts. It enables secure, isolated, and hardware-optimized analysis of massive unstructured and tabular datasets using localized Large Language Models (LLMs).
+
+Unlike standard RAG prototypes, ForensiX is architected for **zero-data-leakage multi-tenancy**, **memory-safe ingestion** of large files, and **strict evidentiary provenance**.
+
+---
+
+## 🏗️ System Architecture
+
+The OpenRAG Engine is built on a distributed, asynchronous microservice architecture:
+
+1. **Ingestion & Storage Layer**: Asynchronous, non-blocking uploads. Raw binaries are streamed directly to **MinIO/S3**, bypassing local JVM memory.
+2. **Parsing & Vectorization Layer**: Utilizes Apache Tika for deep binary extraction. Implements a custom memory-safe, yielding semantic parser for massive CSV files to prevent OOM (Out of Memory) JVM crashes.
+3. **Knowledge Base (Vector DB)**: Relational and high-dimensional vector data are stored in **PostgreSQL + pgvector**. `GIN` indexes and custom PL/pgSQL functions guarantee sub-millisecond tenant isolation and hardware-accelerated cosine distance thresholding.
+4. **Telemetry Layer**: Uses **Redis Pub/Sub** combined with Server-Sent Events (SSE) to broadcast real-time ingestion progress across distributed UI clients.
+5. **AI Inference Layer**: Connects to **Ollama** via Spring AI for air-gapped, local inference. Uses strict JSON-schema adherence and conditional "Escape Hatch" prompt engineering to prevent LLM hallucinations and prompt panic.
+
+---
+
+## ✨ Core Enterprise Features
+
+* **Strict Tenant Isolation**: All vector searches and database operations are forcefully scoped by an `X-Tenant-ID` via a `TenantInterceptor`, ensuring evidence never leaks between investigative cases.
+* **Resilient Connection Pooling**: HikariCP is highly tuned to survive Docker/Network proxy TCP drops, preventing zombie connections and database exhaustion during long-running LLM inferences.
+* **Hybrid Search Optimization**: Combines relational metadata filtering (Case ID, Folder ID, Document ID) with vector similarity. Drops low-confidence chunks (`distance_threshold < 0.75`) before they reach the LLM.
+* **Human-in-the-Loop Synthesis**: Analysts explicitly validate LLM citations. The final case report is synthesized *only* from verified, immutable facts, guaranteeing an unbroken chain of custody.
+
+---
+
+## 💻 Tech Stack
+
+### Backend Core
+* **Java 23**
+* **Spring Boot 3.4.0** (Web, Data JPA, Security)
+* **Spring AI** (Core, Ollama, pgvector, Apache Tika)
+
+### Data & Infrastructure
+* **PostgreSQL 15.4 + pgvector**
+* **Flyway** (Schema Migrations)
+* **Redis** (Pub/Sub & Fast Caching)
+* **MinIO** (S3-Compatible Object Storage)
+* **Docker & Docker Compose**
+
+### Frontend
+* **HTML5 / Vanilla JS** (ES6+)
+* **Tailwind CSS**
+* **Server-Sent Events (SSE) API**
+
+---
+
+## 🚀 Quick Start Guide
+
+### 1. Prerequisites
+* **Docker** & **Docker Compose** installed.
+* **Java 23 JDK** installed.
+* **Maven** installed.
+
+### 2. Infrastructure Spin-Up
+Boot up the required database, cache, storage, and AI containers using the provided `docker-compose.yml`:
+
+```bash
+docker-compose up -d
+
+> **Note:** The `ollama-init` container will automatically pull the required models (`nomic-embed-text`, `llama3.2:3b`, `deepseek-coder-v2:16b`) upon first boot.
+
+### 3. Application Configuration
+Ensure your `src/main/resources/application.properties` points to the local Docker instances. The application will automatically:
+1. Provision the `openrag-evidence-vault` bucket in MinIO.
+2. Execute Flyway scripts to initialize the `pgvector` extension and `hybrid_search` SQL functions.
+
+### 4. Build and Run
+Compile the application and boot the Spring server:
+
+```bash
+mvn clean install
+mvn spring-boot:run
