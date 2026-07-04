@@ -1,64 +1,122 @@
+# ==============================================================================
+# OpenRAG - Local Development & Inference Environment
+# ==============================================================================
+# ARCHITECTURAL OVERVIEW:
+# This compose file provisions the entire infrastructure backbone required for
+# a Retrieval-Augmented Generation (RAG) pipeline on a local machine.
+# It strictly decouples stateful storage (Postgres/MinIO), distributed messaging
+# (Redis), and heavy AI compute (Ollama) into isolated, scalable containers.
+# ==============================================================================
 version: '3.8'
 
 services:
-  # 1. Vector Database
+  # ------------------------------------------------------------------------------
+  # 1. POSTGRES: Relational Metadata & Vector Store
+  # ------------------------------------------------------------------------------
+  # We utilize the `pgvector` extension image rather than standard Postgres.
+  # This allows us to store high-dimensional embeddings (vectors) and execute
+  # hardware-accelerated similarity searches (Cosine, L2) in the same transaction
+  # as our standard relational metadata operations.
   postgres:
     image: ankane/pgvector:latest
     container_name: openrag-postgres
     ports:
+      # SENIOR FIX / PORT MAPPING:
+      # Mapped to 5434 on the host instead of 5432. This defensively prevents
+      # port collisions if a developer already has a native Postgres instance
+      # running on their local machine.
       - "5434:5432"
     environment:
       - POSTGRES_DB=knowledge_base
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
+    # LIFECYCLE MANAGEMENT:
+    # A database container is "up" long before it's actually ready to accept TCP
+    # connections. This healthcheck prevents race conditions where the backend API
+    # tries to connect and crashes before Postgres finishes its init scripts.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d knowledge_base"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  # 2. Redis for Distributed SSE (Pub/Sub)
+  # ------------------------------------------------------------------------------
+  # 2. REDIS: Distributed Pub/Sub & Caching
+  # ------------------------------------------------------------------------------
+  # Acts as our high-throughput message broker. In a RAG ingestion pipeline,
+  # document parsing and vectorization take time. Redis Pub/Sub handles routing
+  # progress events from background worker threads back to the frontend UI
+  # via Server-Sent Events (SSE).
   redis:
     image: redis:alpine
     container_name: openrag-redis
     ports:
       - "6379:6379"
 
-  # 3. MinIO for S3-Compatible Cloud Storage
+  # ------------------------------------------------------------------------------
+  # 3. MINIO: Cloud-Native Object Storage (S3-Compatible)
+  # ------------------------------------------------------------------------------
+  # We do NOT store raw PDF/CSV files in Postgres (which blows out the DB size)
+  # or on the local API filesystem (which breaks horizontal scaling). MinIO acts
+  # as a local emulator for AWS S3, providing a distributed vault for raw evidence.
   minio:
     image: minio/minio:latest
     container_name: openrag-minio
     ports:
-      - "9000:9000"
-      - "9001:9001" # MinIO Console
+      - "9000:9000" # API Port (Backend communicates here)
+      - "9001:9001" # Web UI Console (Developers log in here to inspect files)
     environment:
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin
     command: server /data --console-address ":9001"
     volumes:
-      - minio_data:/data
+      - minio_data:/data # Persists uploaded files across container restarts
 
-  # 4. Ollama AI Engine
+  # ------------------------------------------------------------------------------
+  # 4. OLLAMA: Local LLM Inference Engine
+  # ------------------------------------------------------------------------------
+  # The core compute engine for AI generation. Running this locally guarantees
+  # zero data exfiltration (critical for private/forensic data) and eliminates
+  # API latency/costs associated with OpenAI or Anthropic.
   ollama:
     image: ollama/ollama:latest
     container_name: openrag-ollama
     ports:
       - "11434:11434"
     volumes:
+      # CRITICAL PERSISTENCE:
+      # LLM weights are massive (3GB - 15GB+). If we don't map this volume,
+      # Docker will delete the downloaded models every time the container spins down,
+      # forcing the developer to re-download gigabytes of data on every boot.
       - ollama_data:/root/.ollama
 
-  # 5. AI Initialization Script
+  # ------------------------------------------------------------------------------
+  # 5. OLLAMA-INIT: Automated Model Provisioning
+  # ------------------------------------------------------------------------------
+  # Ephemeral bootstrap container. Instead of forcing developers to manually run
+  # `docker exec ... ollama pull` after spinning up the environment, this container
+  # waits for the Ollama API to boot, issues the REST commands to download the
+  # required models, and then gracefully exits.
   ollama-init:
     image: curlimages/curl:latest
     container_name: openrag-ollama-init
     depends_on:
-      - ollama
+      - ollama # Ensures Ollama is running before executing
     command: >
       sh -c "sleep 10 &&
+             echo 'Pulling Embedding Model (For Vector Math)...' &&
              curl -X POST http://ollama:11434/api/pull -d '{\"name\":\"nomic-embed-text\"}' &&
+             echo 'Pulling Llama 3.2 (Default Inference)...' &&
              curl -X POST http://ollama:11434/api/pull -d '{\"name\":\"llama3.2:3b\"}' &&
+             echo 'Pulling DeepSeek R1 (Advanced Reasoning)...' &&
              curl -X POST http://ollama:11434/api/pull -d '{\"name\":\"deepseek-r1:8b\"}'"
 
+# ==============================================================================
+# PERSISTENT STORAGE VOLUMES
+# ==============================================================================
+# Managed volumes ensure that developer data (LLM weights, raw files) survives
+# `docker-compose down`. (Note: Postgres is deliberately left unmapped here
+# assuming Flyway and ingestion handles DB state, but you can add it if needed).
 volumes:
   ollama_data:
   minio_data:
