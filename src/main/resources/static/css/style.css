@@ -1,11 +1,39 @@
-/* Core background and typography overrides */
+/* ==========================================================================
+   style.css
+   Enterprise UI Overrides & Tailwind Escape Hatch
+   ==========================================================================
+   ARCHITECTURAL NOTE:
+   Because this project utilizes Tailwind CSS via CDN, 95% of our styling is
+   handled directly in the HTML via utility classes. This file is strictly
+   reserved for:
+   1. Pseudo-selectors that are verbose or impossible in standard Tailwind.
+   2. Global resets that establish the baseline aesthetic.
+   3. Defensive CSS to prevent flexbox layouts from exploding.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. GLOBAL FOUNDATION
+   -------------------------------------------------------------------------- */
+/* Establishes the absolute baseline for the 'Dark Terminal' aesthetic.
+   By defining the font family as 'ui-sans-serif, system-ui', we rely entirely
+   on the user's native OS fonts (San Francisco on Mac, Segoe UI on Windows).
+   This guarantees zero network latency for font loading and prevents layout shifts.
+*/
 body {
-    background-color: #0f172a;
-    color: #e2e8f0;
+    background-color: #0f172a; /* Tailwind slate-900 */
+    color: #e2e8f0;            /* Tailwind slate-200 */
     font-family: ui-sans-serif, system-ui, sans-serif;
 }
 
-/* Custom terminal scrollbar */
+/* --------------------------------------------------------------------------
+   2. CUSTOM SCROLLBAR INFRASTRUCTURE
+   -------------------------------------------------------------------------- */
+/* UX DECISION:
+   Default OS scrollbars (especially on Windows) are bright white and bulky.
+   They immediately shatter the immersive "Dark Mode" aesthetic of our app.
+   These pseudo-selectors hijack the browser's native scrollbar rendering
+   for our specific scrollable containers, keeping them slim, dark, and rounded.
+*/
 .terminal-scroll::-webkit-scrollbar,
 .tree-container::-webkit-scrollbar {
     width: 8px;
@@ -13,46 +41,87 @@ body {
 }
 .terminal-scroll::-webkit-scrollbar-thumb,
 .tree-container::-webkit-scrollbar-thumb {
-    background: #334155;
+    background: #334155; /* Tailwind slate-700 */
     border-radius: 4px;
 }
 .terminal-scroll::-webkit-scrollbar-track,
 .tree-container::-webkit-scrollbar-track {
-    background: #0f172a;
+    background: #0f172a; /* Tailwind slate-900 */
 }
 
-/* Smooth transition for disabled states */
+/* --------------------------------------------------------------------------
+   3. ACCESSIBILITY & STATE FEEDBACK
+   -------------------------------------------------------------------------- */
+/* Provides immediate visual feedback when an action is disabled (e.g., the
+   "Valid" button before an AI response is selected). Lowering opacity and
+   changing the cursor prevents the user from rage-clicking a disabled element.
+*/
 input:disabled, button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
 }
 
-/* Tree View Styles for Evidence Library */
+/* --------------------------------------------------------------------------
+   4. HIERARCHICAL DATA VISUALIZATION (File Tree)
+   -------------------------------------------------------------------------- */
+/* Prevents text-highlighting when users are rapidly clicking/double-clicking folders */
 .tree-node {
     user-select: none;
     transition: background-color 0.2s;
 }
 .tree-node:hover {
-    background-color: rgba(51, 65, 85, 0.5);
+    background-color: rgba(51, 65, 85, 0.5); /* Subtle highlight */
 }
+
+/* The Visual Thread:
+   This creates the vertical lines connecting parent folders to their children.
+   Without this, deeply nested Adjacency Lists become a visually confusing wall of text.
+*/
 .tree-line {
-    border-left: 1px solid #475569;
+    border-left: 1px solid #475569; /* Tailwind slate-600 */
     margin-left: 0.6rem;
     padding-left: 0.5rem;
 }
 
-/* Active State for Selected Evidence Chunks */
+/* --------------------------------------------------------------------------
+   5. STATE MANAGEMENT VISUAL ANCHORS
+   -------------------------------------------------------------------------- */
+/* Applied dynamically via JavaScript when a user selects an AI chat message
+   to view its underlying JSON reasoning.
+
+   DEFENSIVE CSS (!important):
+   Because Tailwind utility classes have high specificity, dynamically adding
+   a custom class via JS sometimes fails to override the inline Tailwind classes.
+   Using !important here guarantees the active state always wins the CSS cascade.
+*/
 .msg-active {
-    border: 2px solid #3b82f6 !important;
-    background-color: rgba(30, 41, 59, 0.8) !important;
+    border: 2px solid #3b82f6 !important; /* Tailwind blue-500 */
+    background-color: rgba(30, 41, 59, 0.8) !important; /* Tailwind slate-800 with opacity */
 }
 
-/* Panel Animations */
+/* --------------------------------------------------------------------------
+   6. HARDWARE-ACCELERATED ANIMATIONS
+   -------------------------------------------------------------------------- */
+/* Applied to our main UI columns. When the user clicks the "Toggle" buttons in the
+   header to hide/show columns, this ensures the flexbox layout smoothly glides
+   into place rather than instantly snapping, using a natural easing curve.
+*/
 .panel-transition {
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* SENIOR FIX: The CSS classes required to force long unbroken text strings to wrap */
+/* --------------------------------------------------------------------------
+   7. DEFENSIVE LAYOUT PROTECTION
+   -------------------------------------------------------------------------- */
+/* SENIOR FIX: The Flexbox Container Saver
+   In a digital forensics app, the AI might return an unbroken 500-character string
+   like a Base64 hash, a massive URL, or a corrupted file signature.
+
+   By default, HTML will refuse to break a word, forcing the flexbox container
+   to stretch horizontally beyond the screen width, destroying the UI layout.
+   This utility class forces the browser to brutally break strings at the edge
+   of the container boundary, guaranteeing horizontal scrolling is never triggered.
+*/
 .break-words-safe {
     word-wrap: break-word;
     word-break: break-word;

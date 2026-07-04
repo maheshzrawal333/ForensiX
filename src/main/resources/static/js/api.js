@@ -1,16 +1,32 @@
 /**
- * Enterprise API Service
- * Implements centralized network interception, timeout management, and JWT Auth injection.
+ * Enterprise API Service Gateway
+ * * This module serves as the single source of truth for all outbound network requests
+ * from the ForensiX frontend. By centralizing the `fetch` logic here, we ensure
+ * consistent error handling, unified timeout management, and mathematical enforcement
+ * of our multi-tenant security headers.
  */
 const ApiService = {
 
-    // SENIOR FIX #9: Default timeout reduced to 15 seconds. Only long-running tasks get more.
+    /**
+     * Centralized Network Interceptor and Fetch Wrapper.
+     * * ARCHITECTURAL DESIGN:
+     * We wrap the native `fetch` API to enforce strict lifecycle management on network connections.
+     * Browsers do not time out fetch requests by default; if the backend hangs, the frontend
+     * will hang infinitely, resulting in memory leaks and frozen UIs. We utilize `AbortController`
+     * to forcefully sever dead connections.
+     * * @param {string} endpoint - The relative API path (e.g., '/api/knowledge').
+     * @param {Object} options - Standard fetch options (method, headers, body).
+     * @param {number} timeoutMs - Hyperparameter: Maximum allowed TCP wait time. Defaults to 15s.
+     * @returns {Promise<any>} The parsed JSON payload or a boolean for 204 responses.
+     */
     _fetch: async (endpoint, options = {}, timeoutMs = 15000) => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-        // ARCHITECTURAL DEBT NOTE (#2): In a production environment, this token should be
-        // managed via an HttpOnly cookie set by the backend, not localStorage, to prevent XSS exfiltration.
+        // ARCHITECTURAL DEBT NOTE (#2):
+        // In a production environment, reading JWTs from localStorage is a critical security
+        // vulnerability (CWE-79), as any malicious script (XSS) can steal it.
+        // MIGRATION PATH: Move to HttpOnly, SameSite=Strict cookies set by the backend.
         const token = localStorage.getItem('auth_token');
         const headers = {
             ...options.headers,
@@ -24,22 +40,30 @@ const ApiService = {
                 signal: controller.signal
             });
 
+            // ROBUST ERROR HANDLING:
+            // Instead of just throwing a generic "500 Error", we attempt to parse
+            // Spring Boot's RFC 7807 ProblemDetail JSON response. This surfaces the exact
+            // backend exception message (e.g., "File already exists") directly to the UI.
             if (!response.ok) {
-                // Safely parse Spring Boot's ProblemDetail JSON if it exists
                 const errorData = await response.json().catch(() => ({}));
                 throw new Error(errorData.detail || errorData.message || `HTTP ${response.status} - ${response.statusText}`);
             }
 
-            // HTTP 204 No Content does not have a JSON body to parse
+            // HTTP 204 (No Content) usually occurs on successful DELETE operations.
+            // Attempting to run `.json()` on a 204 will crash the JS execution thread.
             if (response.status === 204) return true;
 
             return await response.json();
         } catch (error) {
+            // Translate the cryptic DOMException into a UX-friendly timeout message
             if (error.name === 'AbortError') {
                 throw new Error(`Request timed out after ${timeoutMs / 1000} seconds.`);
             }
             throw error;
         } finally {
+            // GARBAGE COLLECTION:
+            // Always clear the timeout ID regardless of success or failure to prevent
+            // memory leaks in the browser's event loop.
             clearTimeout(timeoutId);
         }
     },
@@ -47,22 +71,29 @@ const ApiService = {
     // ==========================================
     // INGESTION & EVIDENCE API
     // ==========================================
+
+    /**
+     * Streams a raw binary payload to the backend for AI vectorization.
+     * Note: We deliberately DO NOT set the 'Content-Type' header here. Passing `FormData`
+     * allows the browser to automatically calculate and inject the correct multipart boundary.
+     */
     uploadEvidence: async (file, folderId, caseId) => {
         const formData = new FormData();
         formData.append("file", file);
         formData.append("folderId", folderId);
 
-        // Uploads might take longer, but the SSE stream handles the bulk of the wait.
-        // We'll give the initial upload 30 seconds.
+        // Uploads are network-bound and take time. We give the initial TCP push 30 seconds.
+        // The actual vectorization happens asynchronously via Redis/SSE after this returns.
         return await ApiService._fetch('/api/knowledge/upload', {
             method: 'POST',
-            headers: { 'X-Tenant-ID': caseId }, // Browser automatically sets multipart boundary
+            headers: { 'X-Tenant-ID': caseId },
             body: formData
         }, 30000);
     },
 
     getFiles: async (folderId, caseId) => {
-        // SENIOR FIX #13: Encode URI Component for folderId
+        // DEFENSIVE PROGRAMMING: Encode URI components to prevent path traversal
+        // or HTTP parameter pollution if a folder name contains special characters (&, ?, =).
         const queryFolder = folderId === "root" ? "root" : encodeURIComponent(folderId);
         return await ApiService._fetch(`/api/knowledge/documents?folderId=${queryFolder}`, {
             method: 'GET',
@@ -80,6 +111,7 @@ const ApiService = {
     // ==========================================
     // FOLDER HIERARCHY API
     // ==========================================
+
     getFolders: async (parentFolderId, caseId) => {
         const url = `/api/folders` + (parentFolderId && parentFolderId !== "root" ? `?parentFolderId=${encodeURIComponent(parentFolderId)}` : "");
         return await ApiService._fetch(url, {
@@ -120,12 +152,17 @@ const ApiService = {
     },
 
     // ==========================================
-    // AI FORENSICS API
+    // AI FORENSICS API (High-Latency Endpoints)
     // ==========================================
+
+    /**
+     * Dispatches a semantic query to the Retrieval-Augmented Generation (RAG) pipeline.
+     */
     askStructuredQuestion: async (question, folderIds, caseId, modelName) => {
-        // SENIOR FIX: Increased timeout from 120,000ms to 300,000ms (5 minutes).
-        // Tabular data (CSVs) and dense RAG contexts require massive compute time
-        // for local LLMs to generate tokens. We must not sever the connection prematurely.
+        // CRITICAL TUNING: Increased timeout to 300,000ms (5 minutes).
+        // Processing massive tabular data (CSVs) or dense context windows via local LLMs
+        // is heavily compute-bound (GPU/CPU). If we use the default 15s timeout here,
+        // the frontend will silently drop the connection right before the LLM finishes generating.
         return await ApiService._fetch('/api/forensics/analyze', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': caseId },
@@ -133,8 +170,12 @@ const ApiService = {
         }, 300000);
     },
 
+    /**
+     * Synthesizes user-validated facts into a cohesive chronological narrative.
+     */
     generateReport: async (validatedEvidenceList, caseId, modelName) => {
-        // SENIOR FIX #9: Report synthesis needs a longer timeout (120 seconds)
+        // Report synthesis requires less database retrieval but high LLM token generation.
+        // 120 seconds provides a safe buffer for slower, quantized models.
         return await ApiService._fetch('/api/forensics/report', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': caseId },
@@ -145,6 +186,7 @@ const ApiService = {
     // ==========================================
     // SYSTEM & TENANT ADMIN API
     // ==========================================
+
     getTenants: async () => {
         return await ApiService._fetch('/api/admin/tenants', { method: 'GET' });
     },
@@ -156,11 +198,20 @@ const ApiService = {
         });
     },
 
+    /**
+     * Discovers available LLM models on the host machine.
+     */
     getModels: async () => {
         try {
-            // Very short timeout for pinging local models
+            // Extremely short timeout (3s). Model discovery should be near-instantaneous.
+            // If the backend doesn't respond immediately, we assume the Ollama socket is
+            // temporarily busy and fall back to cache.
             return await ApiService._fetch('/api/admin/models', { method: 'GET' }, 3000);
         } catch (e) {
+            // GRACEFUL DEGRADATION:
+            // If the backend endpoint fails, we do not crash the UI. We silently catch the
+            // error and provide a hardcoded array of standard offline models so the user
+            // can continue interacting with the app.
             console.warn("Backend model endpoint unavailable. Failing over to local offline inventory.", e);
             return [
                 "llama3.2:3b",

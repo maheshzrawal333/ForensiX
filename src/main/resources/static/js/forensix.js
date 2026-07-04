@@ -1,15 +1,32 @@
 /**
- * ForensiX - Enterprise Human-In-The-Loop Architecture
+ * ============================================================================
+ * ForensiX - Enterprise Human-In-The-Loop (HITL) UI Controller
+ * ============================================================================
+ * ARCHITECTURAL OVERVIEW:
+ * This file acts as the primary orchestrator for the ForensiX investigation terminal.
+ * It strictly separates transient frontend state (chat history, selected contexts)
+ * from persistent backend state, ensuring that investigators have full control over
+ * what the AI sees (Context Selection) and what is ultimately saved (Fact Validation).
  */
 
-let chatHistory = {};
-let activeMessageId = null;
-let verifiedFacts = [];
-let selectedContexts = new Map();
+// ==========================================
+// 1. GLOBAL STATE MANAGEMENT
+// ==========================================
+// This transient state is deliberately wiped clean every time the user switches
+// investigative cases to mathematically prevent cross-case data contamination in the UI.
 
-// SENIOR FIX #5: Generation counter to prevent out-of-order async race conditions when switching cases
+let chatHistory = {};           // Ledger mapping UI Message IDs to their raw AI JSON payloads
+let activeMessageId = null;     // Tracks which chat bubble is currently selected for reasoning review
+let verifiedFacts = [];         // The Human-In-The-Loop queue. Facts stored here will be synthesized into the final report.
+let selectedContexts = new Map(); // Tracks selected checkboxes (Folders/Files) to scope the RAG Vector Search.
+
+// SENIOR FIX #5: The Async Race Condition Preventer.
+// If an investigator starts a 60-second folder expansion, but switches cases 5 seconds later,
+// the original network request will eventually return and inject Folder A into Case B's UI.
+// By tracking the "Generation", async callbacks can abort if the user has moved on.
 let caseGeneration = 0;
 
+// Centralized DOM Reference Dictionary to prevent repetitive document.getElementById calls
 const elements = {
     caseId: document.getElementById('caseId'),
     fileTreeContainer: document.getElementById('fileTreeContainer'),
@@ -24,12 +41,25 @@ const elements = {
     verifiedCount: document.getElementById('verifiedCount')
 };
 
+// ==========================================
+// 2. UTILITY FUNCTIONS
+// ==========================================
+
+/**
+ * Safely swaps a single CSS class on a DOM element.
+ */
 function swapClass(el, oldCls, newCls) {
     if (!el) return;
     if (oldCls) el.classList.remove(oldCls);
     if (newCls) el.classList.add(newCls);
 }
 
+/**
+ * SECURITY BOUNDARY: XSS Prevention
+ * The AI generates text that is injected directly into our DOM via innerHTML.
+ * We must aggressively sanitize all HTML characters to prevent Stored XSS attacks
+ * if the AI decides to hallucinate a <script> tag.
+ */
 function escapeHTML(str) {
     if (str === null || str === undefined) return '';
     return String(str)
@@ -40,6 +70,13 @@ function escapeHTML(str) {
         .replace(/'/g, '&#039;');
 }
 
+// ==========================================
+// 3. CUSTOM MODAL INFRASTRUCTURE
+// ==========================================
+/**
+ * Replaces native browser alert()/prompt() which block the main thread and look unprofessional.
+ * Implements strict accessibility guidelines (focus trapping, escape key to close).
+ */
 const CustomModal = {
     _timeoutId: null,
     _lastActiveElement: null,
@@ -47,7 +84,8 @@ const CustomModal = {
     show: (title, message, type, confirmBtnText, confirmBtnColorClass, onConfirmCallback) => {
         if (CustomModal._timeoutId) clearTimeout(CustomModal._timeoutId);
 
-        // SENIOR FIX #15: Store the element that had focus before opening the modal
+        // SENIOR FIX #15: Accessibility Focus Management
+        // Remember what the user was focused on before the modal hijacked the screen.
         CustomModal._lastActiveElement = document.activeElement;
 
         const overlay = document.getElementById('modalOverlay');
@@ -64,7 +102,7 @@ const CustomModal = {
         if (type === 'prompt') {
             input.classList.remove('hidden');
             input.value = '';
-            setTimeout(() => input.focus(), 50);
+            setTimeout(() => input.focus(), 50); // Delay required for Tailwind transitions
         } else {
             input.classList.add('hidden');
             confirmBtn.focus();
@@ -74,6 +112,7 @@ const CustomModal = {
         overlay.classList.add('flex');
         setTimeout(() => swapClass(content, 'scale-95', 'scale-100'), 10);
 
+        // Clone and replace the confirm button to instantly wipe any old event listeners attached to it.
         const newConfirmBtn = confirmBtn.cloneNode(true);
         confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
 
@@ -86,7 +125,7 @@ const CustomModal = {
 
         document.getElementById('modalCancel').onclick = CustomModal.close;
 
-        // SENIOR FIX #15: Escape to close & Backdrop click to close
+        // SENIOR FIX #15: UX Standard - Escape to close & Backdrop click to close
         const keyHandler = (e) => {
             if (e.key === 'Escape') {
                 CustomModal.close();
@@ -115,27 +154,36 @@ const CustomModal = {
             overlay.classList.remove('flex');
             overlay.classList.add('hidden');
 
-            // SENIOR FIX #15: Return focus
+            // Return focus to the original element to maintain keyboard navigation flow
             if (CustomModal._lastActiveElement) {
                 CustomModal._lastActiveElement.focus();
                 CustomModal._lastActiveElement = null;
             }
-        }, 150);
+        }, 150); // Matches CSS transition duration
     }
 };
 
+// ==========================================
+// 4. BOOTSTRAP & EVENT BINDING
+// ==========================================
 document.addEventListener("DOMContentLoaded", async () => {
+
+    // RAG Pipeline Bindings
     elements.askBtn.addEventListener("click", handleAsk);
-    // SENIOR FIX #12: Changed 'keypress' to 'keydown'
+    // SENIOR FIX #12: Changed 'keypress' to 'keydown' for better cross-browser compatibility
     elements.questionInput.addEventListener("keydown", (e) => { if (e.key === 'Enter') handleAsk(); });
     elements.validBtn.addEventListener("click", handleValidateReason);
     elements.generateReportBtn.addEventListener("click", handleGenerateReport);
 
+    // Structure Pipeline Bindings
     document.getElementById('refreshBtn').addEventListener("click", refreshTreeState);
     document.getElementById('newFolderBtn').addEventListener("click", handleCreateFolder);
     document.getElementById('newCaseBtn').addEventListener("click", handleCreateCase);
 
-    // SENIOR FIX #7: Guarding case switches if there is unsaved validated work
+    // SENIOR FIX #7: Guarding case switches to prevent data loss.
+    // If an investigator has validated facts but hasn't generated a report, switching cases
+    // clears the state. We intercept the dropdown change, warn the user, and revert the UI
+    // if they decline.
     let previousCaseValue = elements.caseId.value;
     elements.caseId.addEventListener("change", (e) => {
         const newCaseValue = e.target.value;
@@ -151,7 +199,7 @@ document.addEventListener("DOMContentLoaded", async () => {
                     resetCaseContext();
                 }
             );
-            // Revert the dropdown if they cancel or close the modal
+            // Revert listeners
             document.getElementById('modalCancel').addEventListener('click', () => { e.target.value = previousCaseValue; }, { once: true });
             document.getElementById('modalOverlay').addEventListener('click', (ev) => { if(ev.target.id === 'modalOverlay') e.target.value = previousCaseValue; }, { once: true });
             document.addEventListener('keydown', (ev) => { if(ev.key === 'Escape') e.target.value = previousCaseValue; }, { once: true });
@@ -166,9 +214,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     document.getElementById('globalDeleteBtn').addEventListener('click', handleGlobalDelete);
     document.getElementById('fileInput').addEventListener('change', window.handleUpload);
 
-    // SENIOR FIX #8: Event Delegation for dynamic tree clicks and checkboxes
+    // -----------------------------------------------------------
+    // SENIOR FIX #8: EVENT DELEGATION
+    // -----------------------------------------------------------
+    // The file tree is highly dynamic; folders expand and collapse, generating new HTML.
+    // Rather than attaching hundreds of individual click listeners to every new file row,
+    // we attach ONE listener to the parent container and intercept clicks as they bubble up.
     elements.fileTreeContainer.addEventListener('click', (event) => {
-        // 1. Handle Checkboxes
+
+        // Scenario 1: User clicked a context inclusion checkbox
         if (event.target.matches('.context-checkbox')) {
             const id = event.target.dataset.id;
             const name = event.target.dataset.name;
@@ -179,11 +233,11 @@ document.addEventListener("DOMContentLoaded", async () => {
             } else {
                 selectedContexts.delete(id);
             }
-            updateContextBanner();
+            updateContextBanner(); // Update the RAG Context UI
             return;
         }
 
-        // 2. Handle Folder Expanders
+        // Scenario 2: User clicked to expand/collapse a folder
         const expanderBtn = event.target.closest('[data-role="expander"]');
         const folderRow = event.target.closest('[data-role="folder-row"]');
 
@@ -193,7 +247,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
     });
 
-    // Handle space/enter on rows for accessibility
+    // Keyboard Accessibility for the File Tree (Space/Enter to interact)
     elements.fileTreeContainer.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' || event.key === ' ') {
             const fileRow = event.target.closest('[data-role="file-row"]');
@@ -201,7 +255,7 @@ document.addEventListener("DOMContentLoaded", async () => {
                 event.preventDefault();
                 const cb = fileRow.querySelector('input');
                 cb.checked = !cb.checked;
-                // Trigger the click logic defined in the delegate
+                // Dispatch click to trigger the delegation logic above
                 cb.dispatchEvent(new MouseEvent('click', { bubbles: true }));
                 return;
             }
@@ -214,12 +268,16 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
     });
 
+    // Initialize UI and Fetch remote data
     initViewControllers();
     await loadModels();
     await loadCases();
     resetCaseContext();
 });
 
+// ==========================================
+// 5. VIEW CONTROLLERS (Responsive Panels)
+// ==========================================
 function initViewControllers() {
     function toggleColumn(colId, btnId) {
         const column = document.getElementById(colId);
@@ -242,13 +300,20 @@ function initViewControllers() {
     document.getElementById('toggleCol3')?.addEventListener('click', () => toggleColumn('col-3', 'toggleCol3'));
 }
 
+// ==========================================
+// 6. CORE LOGIC & STATE WIPES
+// ==========================================
 async function loadModels() {
     const models = await ApiService.getModels();
     elements.modelSelector.innerHTML = models.map(m => `<option value="${escapeHTML(m)}">${escapeHTML(m)}</option>`).join('');
 }
 
+/**
+ * Executes a complete wipe of the transient UI state.
+ * Called immediately upon changing the Case ID dropdown to prevent cross-case data leaks.
+ */
 function resetCaseContext() {
-    caseGeneration++; // SENIOR FIX #5: Increment generation
+    caseGeneration++; // SENIOR FIX #5: Increment generation to invalidate hanging async callbacks
     const myGen = caseGeneration;
 
     chatHistory = {};
@@ -264,9 +329,14 @@ function resetCaseContext() {
     elements.reportContainer.innerHTML = `<p class="text-slate-500 italic">Click 'Go' to synthesize a complete case narrative based ONLY on validated evidence.</p>`;
     elements.validBtn.disabled = true;
 
+    // Begin rebuilding the file tree for the newly selected case
     loadRootDirectory(myGen);
 }
 
+/**
+ * Visually renders the selected checkboxes as tags above the chat window.
+ * This ensures the investigator always knows exactly which folders the AI will search.
+ */
 function updateContextBanner() {
     const displayElement = document.getElementById('activeContextDisplay');
     if (selectedContexts.size === 0) {
@@ -294,7 +364,7 @@ async function loadCases(selectTargetId = null) {
         elements.caseId.innerHTML = cases.map(c => `<option value="${escapeHTML(c.id)}">${escapeHTML(c.id)} - ${escapeHTML(c.name)}</option>`).join('');
         if (selectTargetId) elements.caseId.value = selectTargetId;
     } catch (e) {
-        // SENIOR FIX #14: Distinguish offline mode from zero cases
+        // SENIOR FIX #14: Distinguish an offline/unreachable backend from a 0-case state.
         console.error("Failed to load cases:", e);
         elements.caseId.innerHTML = `<option value="DEFAULT-CASE" class="text-red-500">Offline Mode (Local Default)</option>`;
         window.activeCases = [];
@@ -311,7 +381,8 @@ async function handleCreateCase() {
         async (caseName) => {
             if (!caseName) return;
 
-            // SENIOR FIX #4: Generate UUIDs for strong, collision-resistant identity
+            // SENIOR FIX #4: Generate UUIDs on the frontend to allow offline creation capabilities
+            // and guarantee collision-resistant uniqueness.
             const caseId = `CASE-${crypto.randomUUID()}`;
 
             try {
@@ -326,13 +397,22 @@ async function handleCreateCase() {
     );
 }
 
+// ==========================================
+// 7. FILE TREE & DIRECTORY LOGIC
+// ==========================================
+
+/**
+ * Re-syncs the UI tree with the database without collapsing the folders the user had open.
+ */
 async function refreshTreeState() {
+    // 1. Snapshot open folders
     const openFolders = Array.from(document.querySelectorAll('.tree-line:not(.hidden)'))
         .map(el => el.id.replace('children-', ''));
 
     const myGen = caseGeneration;
     await loadRootDirectory(myGen);
 
+    // 2. Re-expand them sequentially
     for (const folderId of openFolders) {
         if (folderId === 'root') continue;
         const childrenContainer = document.getElementById(`children-${folderId}`);
@@ -368,10 +448,17 @@ function getFileIcon(filename) {
     return '📄';
 }
 
+/**
+ * Performs a network fetch to retrieve a single level of the adjacency list.
+ * @param {string} folderId The UUID of the parent directory.
+ * @param {HTMLElement} containerElement The DOM div to inject the children into.
+ * @param {number} gen The current case generation (to abort on case swap).
+ */
 async function expandFolder(folderId, containerElement, gen = caseGeneration) {
     const caseId = elements.caseId.value;
 
     try {
+        // Parallel fetching to minimize UI latency
         const [folders, files] = await Promise.all([
             ApiService.getFolders(folderId, caseId),
             ApiService.getFiles(folderId, caseId)
@@ -386,7 +473,8 @@ async function expandFolder(folderId, containerElement, gen = caseGeneration) {
             return;
         }
 
-        // SENIOR FIX #8: Use data attributes for event delegation instead of inline handlers
+        // We use data-attributes (data-role, data-id) so the Event Delegation
+        // listener attached to the root container can handle interactions.
         folders.forEach(folder => {
             const isChecked = selectedContexts.has(folder.id) ? 'checked' : '';
             const fId = escapeHTML(folder.id);
@@ -438,6 +526,7 @@ async function toggleFolderExpander(folderId) {
     if (childrenContainer.classList.contains('hidden')) {
         childrenContainer.classList.remove('hidden');
         if (expanderIcon) expanderIcon.innerText = '▼';
+        // Lazy-load data only if the container is currently empty
         if (childrenContainer.innerHTML.trim() === '') await expandFolder(folderId, childrenContainer);
     } else {
         childrenContainer.classList.add('hidden');
@@ -445,11 +534,17 @@ async function toggleFolderExpander(folderId) {
     }
 };
 
+// ==========================================
+// 8. FILE SYSTEM MUTATIONS (CRUD)
+// ==========================================
+
 async function handleCreateFolder() {
     let targetFolderId = "root";
     let targetFolderName = "Root";
 
     const selected = Array.from(selectedContexts.entries());
+
+    // UX/Validation Rule: Must select exactly one target directory
     if (selected.length > 1) {
         return CustomModal.show("Action Blocked", "Please select only ONE folder to create a new folder inside.", "alert", "OK", "bg-blue-600", () => {});
     } else if (selected.length === 1) {
@@ -492,10 +587,14 @@ function handleGlobalUpload() {
         targetFolderId = selected[0][0];
     }
 
+    // Pass the state to the hidden file input handler
     window.targetUploadFolderId = targetFolderId;
     document.getElementById('fileInput').click();
 }
 
+/**
+ * Handles the high-latency multipart upload and SSE (Server-Sent Events) pipeline.
+ */
 window.handleUpload = async (event) => {
     const files = event.target.files;
     if (files.length === 0) return;
@@ -504,20 +603,24 @@ window.handleUpload = async (event) => {
     const originalText = document.getElementById('activeContextDisplay').innerHTML;
     document.getElementById('activeContextDisplay').innerHTML = `<span class="text-yellow-400 font-bold bg-slate-800 px-2 py-1 rounded animate-pulse">Uploading ${files.length} items...</span>`;
 
-    // SENIOR FIX #3: Collect failures instead of overwriting the modal
+    // SENIOR FIX #3: Batch Processing Resilience.
+    // In a multi-file upload, if file 2 fails, we should not abort the loop and skip files 3, 4, and 5.
+    // We collect the errors and present a single consolidated alert at the end.
     const failures = [];
 
     for (let i = 0; i < files.length; i++) {
         try {
+            // Step 1: Initiate network upload (Binary to S3)
             const data = await ApiService.uploadEvidence(files[i], targetFolderId, elements.caseId.value);
 
+            // Step 2: Subscribe to the Redis PubSub stream to await vectorization completion
             await new Promise((resolve, reject) => {
                 const eventSource = new EventSource(`/api/jobs/${data.jobId}/stream`);
 
                 const streamTimeout = setTimeout(() => {
                     eventSource.close();
                     reject(new Error("Stream timed out from backend."));
-                }, 600000);
+                }, 600000); // 10 min hard timeout for massive disk images
 
                 eventSource.addEventListener('progress', (e) => {
                     if (e.data === 'Complete') {
@@ -527,7 +630,7 @@ window.handleUpload = async (event) => {
                     }
                 });
 
-                // SENIOR FIX #3: Reject properly on stream loss
+                // SENIOR FIX #3: Handle premature socket closure
                 eventSource.onerror = () => {
                     clearTimeout(streamTimeout);
                     eventSource.close();
@@ -540,7 +643,7 @@ window.handleUpload = async (event) => {
         }
     }
 
-    event.target.value = '';
+    event.target.value = ''; // Reset input to allow re-upload of the same file
     document.getElementById('activeContextDisplay').innerHTML = originalText;
     await refreshTreeState();
 
@@ -575,6 +678,8 @@ async function handleGlobalRename() {
             if (!newName || newName === data.name) return;
             try {
                 await ApiService.renameFolder(id, elements.caseId.value, newName);
+
+                // Optimistically update local context cache without wiping the array
                 selectedContexts.set(id, { name: newName, type: 'folder' });
                 updateContextBanner();
                 await refreshTreeState();
@@ -619,6 +724,7 @@ async function handleGlobalDelete() {
                 CustomModal.show("Partial Success", "Some items could not be deleted. Ensure folders are completely empty before deleting them.", "alert", "OK", "bg-yellow-600", ()=>{});
             }
 
+            // Purge deleted items from the local RAG context array
             successIds.forEach(id => selectedContexts.delete(id));
             updateContextBanner();
             await refreshTreeState();
@@ -626,40 +732,50 @@ async function handleGlobalDelete() {
     );
 }
 
-// --- FORENSIX CHAT & REASONING PIPELINE ---
+// ==========================================
+// 9. RAG CHAT & REASONING PIPELINE (HITL)
+// ==========================================
+
 async function handleAsk() {
     const question = elements.questionInput.value.trim();
     if (!question) return;
 
     const model = elements.modelSelector.value;
+
+    // UI Lockout during inference
     elements.questionInput.value = '';
     elements.questionInput.disabled = true;
-
     elements.askBtn.disabled = true;
     const originalBtnText = elements.askBtn.innerText;
     elements.askBtn.innerText = "⏳...";
 
+    // Pull the active scope from the UI state
     const targetFolderIds = Array.from(selectedContexts.keys());
 
     appendToChat('Detective', question, null);
     const loadingId = appendToChat('AI', 'Analyzing evidence vectors...', null);
 
     try {
+        // Dispatch to pgvector and local LLM
         const data = await ApiService.askStructuredQuestion(question, targetFolderIds, elements.caseId.value, model);
         const msgId = "msg-" + Date.now();
+
+        // Save the structured JSON response into the transient ledger
         chatHistory[msgId] = {
-            question: question, // Keep track of the question asked
+            question: question, // Keep track of the originating prompt for report synthesis
             answer: data.answer || "No conclusion drawn.",
             reasoning: data.reasoning || "No specific evidence cited.",
             isValidated: false
         };
 
+        // Update UI
         updateChatBubble(loadingId, data.answer, msgId);
-        selectMessage(msgId);
+        selectMessage(msgId); // Automatically focus the reasoning panel on the new answer
     } catch (error) {
         console.error("AI Query Failed:", error);
         updateChatBubble(loadingId, "Connection lost to AI core: " + (error.message || "Unknown Error"), null);
     } finally {
+        // Unlock UI
         elements.questionInput.disabled = false;
         elements.askBtn.disabled = false;
         elements.askBtn.innerText = originalBtnText;
@@ -667,20 +783,26 @@ async function handleAsk() {
     }
 }
 
+/**
+ * Triggers when a user clicks an AI chat bubble. Loads the underlying logical trace.
+ */
 function selectMessage(msgId) {
     if (!chatHistory[msgId]) return;
     activeMessageId = msgId;
     const msgData = chatHistory[msgId];
 
+    // Visually highlight the selected message
     document.querySelectorAll('.chat-bubble').forEach(el => el.classList.remove('msg-active'));
     document.getElementById(msgId).classList.add('msg-active');
 
-    // FIX 5: Apply the same aggressive wrapping to the Evidence Trace panel
+    // FIX 5: Apply aggressive CSS wrapping to the Evidence Trace panel to prevent layout explosions
+    // if the LLM cites a massive Base64 string or uninterrupted hash.
     elements.reasonContainer.innerHTML = `
         <div class="font-mono text-blue-300 mb-2 border-b border-slate-600 pb-2">EVIDENCE TRACE:</div>
         <div class="leading-relaxed whitespace-pre-wrap min-w-0" style="word-break: break-word; overflow-wrap: anywhere;">${escapeHTML(msgData.reasoning)}</div>
     `;
 
+    // Manage the Validation Button State
     if (msgData.isValidated) {
         elements.validBtn.disabled = false;
         elements.validBtn.innerText = "✓ Validated (Click to Remove)";
@@ -694,18 +816,23 @@ function selectMessage(msgId) {
     }
 }
 
+/**
+ * The core Human-In-The-Loop mechanism.
+ * Pushes or pops an AI statement from the global "Verified Facts" queue.
+ */
 function handleValidateReason() {
     if (!activeMessageId || !chatHistory[activeMessageId]) return;
 
     const msgData = chatHistory[activeMessageId];
 
-    // SENIOR FIX #6: Maintain provenance and allow toggling Validation status
+    // SENIOR FIX #6: Maintain Provenance Array.
+    // We allow toggling to prevent a user from being locked in if they misclick.
     if (msgData.isValidated) {
-        // Un-validate
+        // Pop fact
         msgData.isValidated = false;
         verifiedFacts = verifiedFacts.filter(fact => fact.messageId !== activeMessageId);
     } else {
-        // Validate
+        // Push fact
         msgData.isValidated = true;
         verifiedFacts.push({
             messageId: activeMessageId,
@@ -717,7 +844,7 @@ function handleValidateReason() {
     }
 
     updateVerifiedCounter();
-    selectMessage(activeMessageId); // Re-render the button state
+    selectMessage(activeMessageId); // Re-render the button UI state
 }
 
 function updateVerifiedCounter() {
@@ -729,7 +856,12 @@ function updateVerifiedCounter() {
     }
 }
 
+// ==========================================
+// 10. NARRATIVE SYNTHESIS (Final Report)
+// ==========================================
+
 async function handleGenerateReport() {
+    // Hard block: The system must not generate a report entirely from hallucinations.
     if (verifiedFacts.length === 0) return CustomModal.show("Action Required", "You must validate at least one piece of evidence before generating a report.", "alert", "OK", "bg-blue-600", ()=>{});
 
     elements.generateReportBtn.disabled = true;
@@ -738,10 +870,14 @@ async function handleGenerateReport() {
 
     try {
         const model = elements.modelSelector.value;
+
+        // Compile the facts into an instruction block
         const evidenceStrings = verifiedFacts.map(fact => `Q: ${fact.question} | A: ${fact.answer} | Cite: ${fact.reasoning}`);
+
+        // Dispatch to backend
         const data = await ApiService.generateReport(evidenceStrings, elements.caseId.value, model);
 
-        // FIX 6: Apply aggressive wrapping to the Report Container
+        // FIX 6: Apply aggressive text wrapping to the final report output
         elements.reportContainer.innerHTML = `<div class="leading-relaxed whitespace-pre-wrap min-w-0" style="word-break: break-word; overflow-wrap: anywhere;">${escapeHTML(data.report)}</div>`;
     } catch (e) {
         console.error("Report generation failed:", e);
@@ -752,37 +888,45 @@ async function handleGenerateReport() {
     }
 }
 
+// ==========================================
+// 11. UI RENDERING ENGINES
+// ==========================================
+
+/**
+ * Injects a new message bubble into the RAG Chat interface.
+ * Implements WhatsApp-style layout mechanics (Self on Right, AI on Left).
+ */
 function appendToChat(role, message, msgId) {
     const isAI = role === 'AI';
     const tempId = msgId || "temp-" + Date.now();
     const msgDiv = document.createElement('div');
 
-    // Row wrapper ensures the bubble aligns left or right
+    // Row wrapper ensures the flex bubble aligns left or right against the bounds of the container
     msgDiv.className = `flex ${isAI ? 'justify-start' : 'justify-end'} w-full mb-3 px-1`;
 
     const clickHandler = isAI ? `onclick="selectMessage('${tempId}')" style="cursor: pointer;"` : "";
 
-    // Generate an inline timestamp (e.g., "7:27 PM")
+    // Generate an inline timestamp (e.g., "7:27 PM") for UI realism
     const timeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-    // WhatsApp Dark Mode Styling Logic
+    // WhatsApp Dark Mode Styling Logic:
     // isAI (Receiver): Slate-700 background, rounded with a sharp top-left corner
     // Detective (Sender): WhatsApp teal (#005c4b), rounded with a sharp top-right corner
     const bubbleStyle = isAI
         ? "bg-slate-700 text-slate-200 rounded-2xl rounded-tl-sm border border-slate-600 hover:border-blue-400 transition-colors shadow-sm"
         : "bg-[#005c4b] text-[#e9edef] rounded-2xl rounded-tr-sm shadow-sm";
 
-    // AI gets a colored name tag at the top of the bubble
     const nameTag = isAI
         ? `<span class="text-[11px] font-bold text-[#53bdeb] mb-0.5 tracking-wide">AI CORE</span>`
         : ``;
 
-    // Time and Read Receipts inline at the bottom right
     const timeTag = isAI
         ? `<span class="text-[10px] text-slate-400">${timeString}</span>`
         : `<span class="text-[10px] text-[#8696a0]">${timeString}</span><span class="text-[#53bdeb] text-xs ml-1 tracking-tighter leading-none">✓✓</span>`;
 
-    // THE CORE FIX: 'w-fit' shrinks the box to perfectly hug the text. 'max-w-[85%]' stops it from growing off-screen.
+    // THE CORE CSS FIX:
+    // 'w-fit' shrinks the box to perfectly hug the text (preventing massive empty bubbles for short messages).
+    // 'max-w-[85%]' stops a long paragraph from stretching entirely across the screen, mimicking mobile chat UX.
     msgDiv.innerHTML = `
         <div id="${tempId}" ${clickHandler} class="chat-bubble flex flex-col w-fit max-w-[85%] px-3 pt-2 pb-1.5 ${bubbleStyle}">
             ${nameTag}
@@ -794,18 +938,24 @@ function appendToChat(role, message, msgId) {
     `;
 
     elements.chatWindow.appendChild(msgDiv);
-    elements.chatWindow.scrollTop = elements.chatWindow.scrollHeight;
+    elements.chatWindow.scrollTop = elements.chatWindow.scrollHeight; // Auto-scroll to bottom
     return tempId;
 }
 
+/**
+ * Updates a temporary "Loading" bubble with the final resolved network response.
+ */
 function updateChatBubble(elementId, newText, newRealId) {
     const el = document.getElementById(elementId);
     if (!el) return;
+
+    // Once the message resolves, bind the click listener for the reasoning panel
     if (newRealId) {
         el.id = newRealId;
         el.setAttribute('onclick', `selectMessage('${newRealId}')`);
     }
-    // Update the text while preserving the WhatsApp timestamps
+
+    // Update the text while preserving the surrounding HTML (like timestamps and name tags)
     el.querySelector('.chat-text').innerText = newText;
     elements.chatWindow.scrollTop = elements.chatWindow.scrollHeight;
 }
