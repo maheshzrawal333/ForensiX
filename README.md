@@ -45,7 +45,6 @@ The platform is built around three constraints that a typical RAG tutorial can i
 - [Known Limitations and Roadmap](#known-limitations-and-roadmap)
 - [Testing](#testing)
 - [Contributing](#contributing)
-- [License](#license)
 - [Author](#author)
 
 ## Key Features
